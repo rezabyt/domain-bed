@@ -23,6 +23,7 @@ from domainbed.lib.misc import (
 
 ALGORITHMS = [
     'ERM',
+    'MAT'
     'Fish',
     'IRM',
     'GroupDRO',
@@ -118,6 +119,141 @@ class ERM(Algorithm):
 
     def predict(self, x):
         return self.network(x)
+
+class MAT(Algorithm):
+
+    def __init__(self, input_shape, num_classes, num_domains, hparams, train_loaders):
+        super(MAT, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        # Check if the train loader is provided
+        assert train_loaders is not None, "Train loaders must be provided for MAT"
+
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier_c = networks.Classifier(self.featurizer.n_outputs, num_classes, 
+                                                self.hparams['nonlinear_classifier'])
+        self.opt_c = torch.optim.Adam([{'params': self.featurizer.parameters()}, {'params': self.classifier_c.parameters()}], 
+                                      lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
+        
+       
+        self.classifier_a, self.opt_a = self.create_bias_classifier(self.featurizer.n_outputs, num_classes, 
+                                                                    self.hparams['nonlinear_classifier'])
+        self.classifier_b, self.opt_b = self.create_bias_classifier(self.featurizer.n_outputs, num_classes, 
+                                                                    self.hparams['nonlinear_classifier'])
+
+        self.y_tr_dynamic = []
+        self.y_tr_true = []
+        for train_loader in train_loaders:
+            train_loader_ys = [y for _, y in train_loader.dataset.underlying_dataset]
+            self.y_tr_dynamic.append(torch.LongTensor(train_loader_ys))
+            self.y_tr_true.append(torch.LongTensor(train_loader_ys))
+
+        # randomly assigns each training example from all environments to one of the bias classifiers.
+        self.assigns = []
+        for i in range(len(self.y_tr_dynamic)):
+            assignments = torch.zeros(len(self.y_tr_dynamic[i]), 1).bernoulli_(0.5)
+            self.assigns.append(assignments)
+        
+        self.num_classes = num_classes
+
+    
+    def create_bias_classifier(self, in_features, out_features, nonlinear_classifier):
+        classifier = networks.Classifier(in_features, out_features, nonlinear_classifier)
+        classifier.weight.data != 0.0
+        classifier.bias.data != 0.0
+
+        # TODO: we previously used a different optimizer for the bias classifier (SGD)
+        opt = torch.optim.Adam(classifier.parameters(), lr=self.hparams['h_lr'], weight_decay=self.hparams['h_weight_decay'])
+        return classifier, opt
+
+
+    def get_loss(self, y_hat, y):
+        losses = F.cross_entropy(y_hat, y.view(-1).long(), reduction='none')
+        return sum([losses[y == yi].mean() for yi in y.unique()])
+
+
+    def flip_y(self, env_idx, samples_idx, pred_ho):
+        p_ho, y_ho = pred_ho.softmax(dim=1).detach().max(1)
+        p_ho, y_ho = p_ho.cpu(), y_ho.cpu()
+        num_y = self.num_classes
+
+        flip = torch.bernoulli((p_ho - 1 / num_y) * num_y / (num_y - 1)).long()
+        self.y_tr_dynamic[env_idx][samples_idx] = flip * y_ho + (1 - flip) * self.y_tr_dynamic[env_idx][samples_idx]
+
+
+    def get_shift(self, pred_ho, y_tr):
+
+        if self.hparams['variant'] == 'MAT_v1':
+            p_ho = F.softmax(pred_ho.detach() / self.hparams['temp'], dim=1)
+            y_ho = torch.argmax(p_ho, dim=1)
+            p_ho_y = p_ho[range(len(y_tr)), y_tr][:, None]
+            num_y, num_m = self.num_classes, self.hparams['num_m']
+            g = num_m * y_tr + y_ho
+
+            avg_p_ho_y_per_group = torch.tensor([p_ho_y[g.eq(g_i)].mean() for g_i in range(num_y * num_m)])
+            avg_p_ho_y_per_group = torch.nan_to_num(avg_p_ho_y_per_group)
+            avg_p_ho_y_per_group = avg_p_ho_y_per_group.reshape(num_y, num_m).T.to(self.device)
+            shift = avg_p_ho_y_per_group[y_ho]
+            return torch.log(shift + 1e-4)
+        
+        elif self.hparams['variant'] == 'MAT_v2':
+            p_ho = F.softmax(pred_ho.detach() / self.hparams['temp'], dim=1)
+            return 0.3 * torch.log(p_ho + 1e-4)
+        
+        else:
+            raise NotImplementedError
+
+
+    def update(self, minibatches, unlabeled=None):
+        device = "cuda" if minibatches[0][1].is_cuda else "cpu"
+        
+        biased_loss = 0
+        unbiased_loss = 0
+        # Iterate over the environments
+        for env_idx, minibatch in enumerate(minibatches):
+            samples_idx, x, y = minibatch
+            y_dyn = self.y_tr_dynamic[env_idx][samples_idx].to(device)
+            
+            features = self.featurizer(x)
+
+            # Stop gradients from the bias classifiers to the featurizer
+            pred_a = self.classifier_a(features.detach())
+            pred_b = self.classifier_b(features.detach())
+
+            assigns = self.assigns[env_idx][samples_idx].to(device)
+            pred_hi = pred_a * assigns + pred_b * (1 - assigns)
+            pred_ho = pred_a * (1 - assigns) + pred_b * assigns
+            
+            # Calculate the loss for the bias classifiers
+            biased_loss += self.get_loss(pred_hi, y_dyn)
+            
+            # Update the dynamic labels
+            self.flip_y(env_idx, samples_idx, pred_ho)
+
+            # Calculate the loss for the unbiased classifier
+            shift = self.get_shift(pred_ho, y)
+            preds = self.classifier_c(features) + shift
+            unbiased_loss += self.get_loss(preds, y)
+
+        # Update the bias classifiers
+        self.opt_a.zero_grad()
+        self.opt_b.zero_grad()
+        biased_loss.backward()
+        self.opt_a.step()
+        self.opt_b.step()
+        
+        # Update the unbiased classifier
+        self.opt_c.zero_grad()
+        unbiased_loss.backward()
+        self.opt_c.step()
+        
+        # TODO: Implement the learning rate scheduler
+        # if self.optim.lr_scheduler is not None:
+        #     self.optim.lr_scheduler.step()
+        
+        return {'biased_loss': biased_loss.item(), 'loss': unbiased_loss.item()}
+
+    def predict(self, x):
+        return self.classifier_c(self.featurizer(x))
 
 
 class Fish(Algorithm):

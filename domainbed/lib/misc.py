@@ -130,16 +130,20 @@ def print_row(row, colwidth=10, latex=False):
 
 class _SplitDataset(torch.utils.data.Dataset):
     """Used by split_dataset"""
-    def __init__(self, underlying_dataset, keys):
+    def __init__(self, underlying_dataset, keys, return_key):
         super(_SplitDataset, self).__init__()
         self.underlying_dataset = underlying_dataset
         self.keys = keys
+        self.return_key = return_key
     def __getitem__(self, key):
-        return self.underlying_dataset[self.keys[key]]
+        if self.return_key:
+            return (self.keys[key], self.underlying_dataset[self.keys[key]])
+        else:
+            return self.underlying_dataset[self.keys[key]]
     def __len__(self):
         return len(self.keys)
 
-def split_dataset(dataset, n, seed=0):
+def split_dataset(dataset, n, seed=0, return_key=False):
     """
     Return a pair of datasets corresponding to a random split of the given
     dataset, with n datapoints in the first dataset and the rest in the last,
@@ -150,7 +154,7 @@ def split_dataset(dataset, n, seed=0):
     np.random.RandomState(seed).shuffle(keys)
     keys_1 = keys[:n]
     keys_2 = keys[n:]
-    return _SplitDataset(dataset, keys_1), _SplitDataset(dataset, keys_2)
+    return _SplitDataset(dataset, keys_1, return_key), _SplitDataset(dataset, keys_2, return_key)
 
 def random_pairs_of_minibatches(minibatches):
     perm = torch.randperm(len(minibatches)).tolist()
@@ -184,14 +188,17 @@ def split_meta_train_test(minibatches, num_meta_test=1):
 
     return pairs
 
-def accuracy(network, loader, weights, device):
+def accuracy(network, loader, weights, device, algorithm_type):
     correct = 0
     total = 0
     weights_offset = 0
 
     network.eval()
     with torch.no_grad():
-        for x, y in loader:
+        for data in loader:
+            # Skip sample indices if using MAT
+            x, y = (data[1] if algorithm_type == 'MAT' else data)
+
             x = x.to(device)
             y = y.to(device)
             p = network.predict(x)
