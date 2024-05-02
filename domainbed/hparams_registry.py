@@ -48,6 +48,12 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('mlp_depth', 3, lambda r: int(r.choice([3, 4, 5])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
 
+    elif algorithm == 'MAT':
+        _hparam('variant', 'MAT_v2', lambda r: r.choice(['MAT_v1, MAT_v2']))
+        _hparam('h_lr', 0.1, lambda r: 10**r.uniform(-2, 1))
+        _hparam('h_weight_decay', 0.0, lambda r: 10**r.uniform(-2, 1))
+        _hparam('temp', 0.1, lambda r: r.choice([0.1, 1.0]))
+
     elif algorithm == 'Fish':
         _hparam('meta_lr', 0.5, lambda r:r.choice([0.05, 0.1, 0.5]))
 

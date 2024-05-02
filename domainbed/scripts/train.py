@@ -121,7 +121,8 @@ if __name__ == "__main__":
 
         out, in_ = misc.split_dataset(env,
             int(len(env)*args.holdout_fraction),
-            misc.seed_hash(args.trial_seed, env_i))
+            misc.seed_hash(args.trial_seed, env_i),
+            return_key=args.algorithm == 'MAT')
 
         if env_i in args.test_envs:
             uda, in_ = misc.split_dataset(in_,
@@ -172,8 +173,12 @@ if __name__ == "__main__":
         for i in range(len(uda_splits))]
 
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
-    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
-        len(dataset) - len(args.test_envs), hparams)
+    if args.algorithm == 'MAT':
+        algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
+            len(dataset) - len(args.test_envs), hparams, train_loaders)
+    else:
+        algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
+            len(dataset) - len(args.test_envs), hparams)
 
     if algorithm_dict is not None:
         algorithm.load_state_dict(algorithm_dict)
@@ -206,13 +211,23 @@ if __name__ == "__main__":
     last_results_keys = None
     for step in range(start_step, n_steps):
         step_start_time = time.time()
-        minibatches_device = [(x.to(device), y.to(device))
-            for x,y in next(train_minibatches_iterator)]
-        if args.task == "domain_adaptation":
-            uda_device = [x.to(device)
-                for x,_ in next(uda_minibatches_iterator)]
+        if args.algorithm == 'MAT':
+            minibatches_device = [(idx, x.to(device), y.to(device))
+                for idx, (x, y) in next(train_minibatches_iterator)]
+            if args.task == "domain_adaptation":
+                uda_device = [x.to(device)
+                    for _, (x, _) in next(uda_minibatches_iterator)]
+            else:
+                uda_device = None
         else:
-            uda_device = None
+            minibatches_device = [(x.to(device), y.to(device))
+                for x, y in next(train_minibatches_iterator)]
+            if args.task == "domain_adaptation":
+                uda_device = [x.to(device)
+                    for x,_ in next(uda_minibatches_iterator)]
+            else:
+                uda_device = None
+    
         step_vals = algorithm.update(minibatches_device, uda_device)
         checkpoint_vals['step_time'].append(time.time() - step_start_time)
 
@@ -230,7 +245,7 @@ if __name__ == "__main__":
 
             evals = zip(eval_loader_names, eval_loaders, eval_weights)
             for name, loader, weights in evals:
-                acc = misc.accuracy(algorithm, loader, weights, device)
+                acc = misc.accuracy(algorithm, loader, weights, device, algorithm_type=args.algorithm)
                 results[name+'_acc'] = acc
 
             results['mem_gb'] = torch.cuda.max_memory_allocated() / (1024.*1024.*1024.)
