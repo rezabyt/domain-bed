@@ -141,11 +141,9 @@ class MAT(Algorithm):
                                                                     self.hparams['nonlinear_classifier'])
 
         self.y_tr_dynamic = []
-        self.y_tr_true = []
         for train_loader in train_loaders:
             train_loader_ys = [y for _, y in train_loader.dataset.underlying_dataset]
             self.y_tr_dynamic.append(torch.LongTensor(train_loader_ys))
-            self.y_tr_true.append(torch.LongTensor(train_loader_ys))
 
         # randomly assigns each training example from all environments to one of the bias classifiers.
         self.assigns = []
@@ -157,6 +155,9 @@ class MAT(Algorithm):
 
     
     def create_bias_classifier(self, in_features, out_features, nonlinear_classifier):
+        if nonlinear_classifier:
+            raise NotImplementedError('Nonlinear classifier is not supported for the bias classifier.')
+        
         classifier = networks.Classifier(in_features, out_features, nonlinear_classifier)
         classifier.weight.data != 0.0
         classifier.bias.data != 0.0
@@ -233,6 +234,9 @@ class MAT(Algorithm):
             shift = self.get_shift(pred_ho, y)
             preds = self.classifier_c(features) + shift
             unbiased_loss += self.get_loss(preds, y)
+
+        biased_loss /= len(minibatches)
+        unbiased_loss /= len(minibatches)
 
         # Update the bias classifiers
         self.opt_a.zero_grad()
